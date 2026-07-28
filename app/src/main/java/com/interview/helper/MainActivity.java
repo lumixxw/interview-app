@@ -4,6 +4,7 @@ import android.Manifest;
 import android.app.Activity;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.media.MediaRecorder;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -15,6 +16,11 @@ import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.Toast;
+import android.util.Base64;
+
+import java.io.File;
+import java.io.FileInputStream;
+import java.util.Arrays;
 
 /**
  * 这个 App 其实是一个"套壳浏览器"：打开就直接加载我们的面试复盘网页，
@@ -32,6 +38,11 @@ public class MainActivity extends Activity {
     private WebView webView;
     // 文件选择器回调（上传录音 / 上传简历要用）
     private ValueCallback<Uri[]> mFilePathCallback;
+
+    // 系统原生录音（绕开 Android WebView 不稳定的 getUserMedia 麦克风）
+    private MediaRecorder mRecorder;
+    private boolean mRecording = false;
+    private File mRecFile;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -87,6 +98,8 @@ public class MainActivity extends Activity {
 
         // 暴露给网页的桥：网页点录音时调用，用来申请安卓麦克风权限
         webView.addJavascriptInterface(new MicBridge(), "AndroidBridge");
+        // 暴露给网页的桥：系统原生录音（开始 / 停止），录完把文件传回网页转写
+        webView.addJavascriptInterface(new RecorderBridge(), "AndroidRecorder");
 
         // 向系统申请录音权限（安卓 6.0 以上需要运行时申请）
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
@@ -123,6 +136,89 @@ public class MainActivity extends Activity {
         }
     }
 
+    // 网页通过 AndroidRecorder 调用的桥：系统原生录音（绕开 WebView getUserMedia 的不稳定）
+    private class RecorderBridge {
+        // 开始录音：先确认系统麦克风权限，再用 MediaRecorder 录到应用私有目录
+        @JavascriptInterface
+        public void startRecording() {
+            if (checkSelfPermission(Manifest.permission.RECORD_AUDIO)
+                    != PackageManager.PERMISSION_GRANTED) {
+                requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQUEST_RECORD);
+                Toast.makeText(MainActivity.this, "请允许麦克风权限后再次点击开始录音",
+                        Toast.LENGTH_SHORT).show();
+                return;
+            }
+            try {
+                mRecFile = new File(getExternalFilesDir(null), "interview_record.m4a");
+                if (mRecFile.exists()) mRecFile.delete();
+                mRecorder = new MediaRecorder();
+                mRecorder.setAudioSource(MediaRecorder.AudioSource.MIC);
+                mRecorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4);
+                mRecorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC);
+                mRecorder.setOutputFile(mRecFile.getAbsolutePath());
+                mRecorder.prepare();
+                mRecorder.start();
+                mRecording = true;
+                evalJs("onNativeRecState('recording')");
+            } catch (Exception e) {
+                mRecording = false;
+                evalJs("onNativeError('录音启动失败：" + e.getMessage() + "')");
+            }
+        }
+
+        // 停止录音：结束 MediaRecorder，然后把文件分段 base64 传回网页去转写
+        @JavascriptInterface
+        public void stopRecording() {
+            if (!mRecording || mRecorder == null) {
+                evalJs("onNativeError('当前没有正在录音')");
+                return;
+            }
+            try {
+                mRecorder.stop();
+            } catch (Exception ignore) {
+            }
+            try {
+                mRecorder.release();
+            } catch (Exception ignore) {
+            }
+            mRecorder = null;
+            mRecording = false;
+            evalJs("onNativeRecState('stopped')");
+            if (mRecFile != null && mRecFile.exists()) {
+                transferFile(mRecFile, "interview.m4a", "audio/m4a");
+            } else {
+                evalJs("onNativeError('录音文件未生成')");
+            }
+        }
+    }
+
+    // 在 UI 线程执行网页 JS（evaluateJavascript 必须在主线程）
+    private void evalJs(String js) {
+        runOnUiThread(() -> webView.evaluateJavascript(js, null));
+    }
+
+    // 把录音文件分块读成 base64，逐块传给网页 onNativeChunk，最后 onNativeDone
+    private void transferFile(File file, String name, String mime) {
+        new Thread(() -> {
+            try {
+                FileInputStream fis = new FileInputStream(file);
+                byte[] buf = new byte[512 * 1024];
+                int n;
+                while ((n = fis.read(buf)) > 0) {
+                    byte[] chunk = (n == buf.length) ? buf : Arrays.copyOf(buf, n);
+                    String b64 = Base64.encodeToString(chunk, Base64.NO_WRAP);
+                    final String js = "onNativeChunk('" + b64 + "')";
+                    runOnUiThread(() -> webView.evaluateJavascript(js, null));
+                }
+                fis.close();
+                runOnUiThread(() -> webView.evaluateJavascript(
+                        "onNativeDone('" + name + "','" + mime + "')", null));
+            } catch (Exception e) {
+                evalJs("onNativeError('传输录音失败：" + e.getMessage() + "')");
+            }
+        }).start();
+    }
+
     // 文件选择结果回传给网页
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
@@ -148,6 +244,18 @@ public class MainActivity extends Activity {
             } else {
                 Toast.makeText(this, "麦克风权限被拒绝，请在系统设置中允许后重试", Toast.LENGTH_LONG).show();
             }
+        }
+    }
+
+    // App 退出时释放录音资源，避免占用麦克风
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        if (mRecording && mRecorder != null) {
+            try { mRecorder.stop(); } catch (Exception ignore) {}
+            try { mRecorder.release(); } catch (Exception ignore) {}
+            mRecorder = null;
+            mRecording = false;
         }
     }
 

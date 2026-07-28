@@ -100,17 +100,25 @@ public class MainActivity extends Activity {
         webView.loadUrl(TARGET_URL);
     }
 
-    // 网页通过 AndroidBridge.requestMic() 调用：确保麦克风权限已授予
+    // 网页通过 AndroidBridge 调用的桥
     private class MicBridge {
+        // requestMic：仅确保系统麦克风权限已授予（不在此自动开始录音，避免丢失点击手势导致授权失败）
         @JavascriptInterface
         public void requestMic() {
             if (checkSelfPermission(Manifest.permission.RECORD_AUDIO)
-                    == PackageManager.PERMISSION_GRANTED) {
-                // 已授权：直接让网页继续录音
-                runOnUiThread(() -> webView.evaluateJavascript("window.__micReady=true; startRec();", null));
-            } else {
-                // 未授权：向系统申请（会弹出允许框）；结果在 onRequestPermissionsResult 处理
+                    != PackageManager.PERMISSION_GRANTED) {
                 requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQUEST_RECORD);
+            }
+        }
+        // openExternal：用系统浏览器/对应 App 打开外部链接（如进入线上面试、打开地图）
+        @JavascriptInterface
+        public void openExternal(String url) {
+            if (url == null || url.isEmpty()) return;
+            try {
+                Intent i = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
+                startActivity(i);
+            } catch (Exception e) {
+                Toast.makeText(MainActivity.this, "无法打开链接：" + url, Toast.LENGTH_SHORT).show();
             }
         }
     }
@@ -136,8 +144,7 @@ public class MainActivity extends Activity {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
         if (requestCode == REQUEST_RECORD) {
             if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-                // 授权成功：让网页继续录音
-                webView.evaluateJavascript("window.__micReady=true; startRec();", null);
+                Toast.makeText(this, "麦克风已授权，请再次点击开始录音", Toast.LENGTH_SHORT).show();
             } else {
                 Toast.makeText(this, "麦克风权限被拒绝，请在系统设置中允许后重试", Toast.LENGTH_LONG).show();
             }

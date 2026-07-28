@@ -1,0 +1,6 @@
+build/
+*.apk
+build_wait*.sh
+artifacts.json
+run_*.json
+logs*/

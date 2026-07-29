@@ -20,7 +20,17 @@ import android.util.Base64;
 
 import java.io.File;
 import java.io.FileInputStream;
+import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.text.SimpleDateFormat;
 import java.util.Arrays;
+import java.util.Date;
+import java.util.Locale;
+import java.util.TimeZone;
 
 /**
  * 这个 App 其实是一个"套壳浏览器"：打开就直接加载我们的面试复盘网页，
@@ -100,6 +110,8 @@ public class MainActivity extends Activity {
         webView.addJavascriptInterface(new MicBridge(), "AndroidBridge");
         // 暴露给网页的桥：系统原生录音（开始 / 停止），录完把文件传回网页转写
         webView.addJavascriptInterface(new RecorderBridge(), "AndroidRecorder");
+        // 暴露给网页的桥：绕过 WebView 网络限制，用 App 原生 HTTP 上传文件到 COS
+        webView.addJavascriptInterface(new UploadBridge(), "AndroidUploader");
 
         // 向系统申请录音权限（安卓 6.0 以上需要运行时申请）
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
@@ -245,6 +257,124 @@ public class MainActivity extends Activity {
                 Toast.makeText(this, "麦克风权限被拒绝，请在系统设置中允许后重试", Toast.LENGTH_LONG).show();
             }
         }
+    }
+
+    // 网页通过 AndroidUploader 调用的桥：用 App 原生 HttpURLConnection 上传 COS，绕开 WebView 网络限制
+    private class UploadBridge {
+        @JavascriptInterface
+        public void upload(String bucket, String region, String secretId, String secretKey,
+                           String key, String mime, String base64) {
+            if (bucket == null || region == null || secretId == null || secretKey == null
+                    || key == null || base64 == null) {
+                evalJs("onUploadErr('上传参数不完整')");
+                return;
+            }
+            new Thread(() -> {
+                try {
+                    byte[] data = Base64.decode(base64, Base64.DEFAULT);
+                    String url = CosSigner.presignedPutUrl(bucket, region, secretId, secretKey, key);
+                    HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
+                    conn.setRequestMethod("PUT");
+                    conn.setDoOutput(true);
+                    conn.setConnectTimeout(20000);
+                    conn.setReadTimeout(60000);
+                    conn.setRequestProperty("Content-Type", mime != null && !mime.isEmpty() ? mime : "application/octet-stream");
+                    conn.setFixedLengthStreamingMode(data.length);
+                    OutputStream out = conn.getOutputStream();
+                    out.write(data);
+                    out.flush();
+                    out.close();
+                    int code = conn.getResponseCode();
+                    if (code == 200) {
+                        evalJs("onUploadOk('" + escapeJs(url) + "')");
+                    } else {
+                        String msg = readStream(conn.getErrorStream());
+                        evalJs("onUploadErr('HTTP " + code + " " + escapeJs(msg) + "')");
+                    }
+                    conn.disconnect();
+                } catch (Exception e) {
+                    evalJs("onUploadErr('" + escapeJs(e.getMessage() != null ? e.getMessage() : "上传异常") + "')");
+                }
+            }).start();
+        }
+    }
+
+    // COS 预签名 URL 生成（签名 v1，仅用于 PUT Object）
+    // 注：COS 的 sign_key 是 hex 字符串，第二次 HMAC 时直接把它当字符串用（不解码成字节）
+    private static class CosSigner {
+        static String presignedPutUrl(String bucket, String region, String secretId,
+                                      String secretKey, String key) throws Exception {
+            String host = bucket + ".cos." + region + ".myqcloud.com";
+            String encodedKey = encodeKey(key);
+            long now = System.currentTimeMillis() / 1000;
+            long start = now - 60;       // COS SDK 习惯提前 60 秒开始
+            long end = start + 3660;     // 有效 1 小时（与 COS SDK 行为对齐）
+            String keyTime = start + ";" + end;
+            String signKey = hmacSha1Hex(secretKey.getBytes(StandardCharsets.UTF_8), keyTime);
+            String httpString = "put\n/" + encodedKey + "\n\nhost=" + encodeHeaderValue(host) + "\n";
+            String stringToSign = "sha1\n" + keyTime + "\n" + sha1Hex(httpString) + "\n";
+            String signature = hmacSha1Hex(signKey.getBytes(StandardCharsets.UTF_8), stringToSign);
+            return "https://" + host + "/" + encodedKey
+                    + "?q-sign-algorithm=sha1"
+                    + "&q-ak=" + URLEncoder.encode(secretId, "UTF-8")
+                    + "&q-sign-time=" + keyTime
+                    + "&q-key-time=" + keyTime
+                    + "&q-header-list=host"
+                    + "&q-url-param-list="
+                    + "&q-signature=" + signature;
+        }
+
+        static String encodeKey(String key) throws Exception {
+            // 对 key 中特殊字符编码，斜杠保留作为路径分隔
+            StringBuilder sb = new StringBuilder();
+            for (char c : key.toCharArray()) {
+                if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
+                        || c == '/' || c == '-' || c == '_' || c == '.') {
+                    sb.append(c);
+                } else {
+                    sb.append(URLEncoder.encode(String.valueOf(c), "UTF-8").replace("+", "%20"));
+                }
+            }
+            return sb.toString();
+        }
+
+        static String encodeHeaderValue(String value) throws Exception {
+            return URLEncoder.encode(value, "UTF-8").replace("+", "%20");
+        }
+
+        static String hmacSha1Hex(byte[] key, String msg) throws Exception {
+            javax.crypto.Mac mac = javax.crypto.Mac.getInstance("HmacSHA1");
+            mac.init(new javax.crypto.spec.SecretKeySpec(key, "HmacSHA1"));
+            return bytesToHex(mac.doFinal(msg.getBytes(StandardCharsets.UTF_8)));
+        }
+
+        static String sha1Hex(String data) throws Exception {
+            MessageDigest md = MessageDigest.getInstance("SHA-1");
+            return bytesToHex(md.digest(data.getBytes(StandardCharsets.UTF_8)));
+        }
+
+        static String bytesToHex(byte[] bytes) {
+            StringBuilder sb = new StringBuilder();
+            for (byte b : bytes) sb.append(String.format("%02x", b));
+            return sb.toString();
+        }
+    }
+
+    private String escapeJs(String s) {
+        if (s == null) return "";
+        return s.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n").replace("\r", "");
+    }
+
+    private String readStream(java.io.InputStream is) {
+        if (is == null) return "";
+        try {
+            byte[] buf = new byte[1024];
+            int n;
+            StringBuilder sb = new StringBuilder();
+            while ((n = is.read(buf)) > 0) sb.append(new String(buf, 0, n, StandardCharsets.UTF_8));
+            is.close();
+            return sb.toString();
+        } catch (Exception e) { return ""; }
     }
 
     // App 退出时释放录音资源，避免占用麦克风

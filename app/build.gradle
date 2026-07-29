@@ -26,4 +26,6 @@ android {
 
 dependencies {
     // 纯套壳，无需额外依赖
+    // FileProvider 用于把缓存文件分享给微信等应用
+    implementation 'androidx.core:core:1.12.0'
 }

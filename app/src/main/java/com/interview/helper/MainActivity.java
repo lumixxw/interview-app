@@ -20,6 +20,7 @@ import android.util.Base64;
 
 import java.io.File;
 import java.io.FileInputStream;
+import java.io.FileOutputStream;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
@@ -116,6 +117,8 @@ public class MainActivity extends Activity {
         webView.addJavascriptInterface(new UploadBridge(), "AndroidUploader");
         // 暴露给网页的桥：绕过 WebView CORS，用 App 原生 HTTP 调用腾讯云 ASR
         webView.addJavascriptInterface(new AsrBridge(), "AndroidAsr");
+        // 暴露给网页的桥：把录音文件分享到微信等应用
+        webView.addJavascriptInterface(new ShareBridge(), "AndroidShare");
 
         // 向系统申请录音权限（安卓 6.0 以上需要运行时申请）
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
@@ -514,6 +517,57 @@ public class MainActivity extends Activity {
             StringBuilder sb = new StringBuilder();
             for (byte b : bytes) sb.append(String.format("%02x", b));
             return sb.toString();
+        }
+    }
+
+    // 网页通过 AndroidShare 调用的桥：把录音文件分享到微信等应用
+    private class ShareBridge {
+        @JavascriptInterface
+        public void shareAudio(String base64, String fileName, String mimeType) {
+            if (base64 == null || base64.isEmpty() || fileName == null || fileName.isEmpty()) {
+                Toast.makeText(MainActivity.this, "分享参数不完整", Toast.LENGTH_SHORT).show();
+                return;
+            }
+            runOnUiThread(() -> {
+                try {
+                    byte[] data = Base64.decode(base64, Base64.DEFAULT);
+                    File cacheDir = new File(getCacheDir(), "shared_audio");
+                    if (!cacheDir.exists()) cacheDir.mkdirs();
+                    File outFile = new File(cacheDir, fileName);
+                    FileOutputStream fos = new FileOutputStream(outFile);
+                    fos.write(data);
+                    fos.flush();
+                    fos.close();
+
+                    Uri uri = androidx.core.content.FileProvider.getUriForFile(
+                            MainActivity.this,
+                            getPackageName() + ".fileprovider",
+                            outFile);
+
+                    Intent shareIntent = new Intent(Intent.ACTION_SEND);
+                    shareIntent.setType(mimeType != null && !mimeType.isEmpty() ? mimeType : "audio/*");
+                    shareIntent.putExtra(Intent.EXTRA_STREAM, uri);
+                    shareIntent.putExtra(Intent.EXTRA_TITLE, fileName);
+                    shareIntent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                    shareIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+
+                    // 优先尝试直接唤起微信；如果微信不存在，则弹出系统分享面板
+                    Intent wechatIntent = new Intent(Intent.ACTION_SEND);
+                    wechatIntent.setType(shareIntent.getType());
+                    wechatIntent.putExtra(Intent.EXTRA_STREAM, uri);
+                    wechatIntent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                    wechatIntent.setPackage("com.tencent.mm");
+
+                    if (wechatIntent.resolveActivity(getPackageManager()) != null) {
+                        startActivity(wechatIntent);
+                    } else {
+                        Intent chooser = Intent.createChooser(shareIntent, "分享录音到");
+                        startActivity(chooser);
+                    }
+                } catch (Exception e) {
+                    Toast.makeText(MainActivity.this, "分享失败：" + e.getMessage(), Toast.LENGTH_LONG).show();
+                }
+            });
         }
     }
 

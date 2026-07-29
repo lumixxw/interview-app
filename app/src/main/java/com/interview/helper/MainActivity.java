@@ -276,8 +276,8 @@ public class MainActivity extends Activity {
             new Thread(() -> {
                 try {
                     byte[] data = Base64.decode(base64, Base64.DEFAULT);
-                    String url = CosSigner.presignedPutUrl(bucket, region, secretId, secretKey, key);
-                    HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
+                    String putUrl = CosSigner.presignedPutUrl(bucket, region, secretId, secretKey, key);
+                    HttpURLConnection conn = (HttpURLConnection) new URL(putUrl).openConnection();
                     conn.setRequestMethod("PUT");
                     conn.setDoOutput(true);
                     conn.setConnectTimeout(20000);
@@ -290,7 +290,9 @@ public class MainActivity extends Activity {
                     out.close();
                     int code = conn.getResponseCode();
                     if (code == 200) {
-                        evalJs("onUploadOk('" + escapeJs(url) + "')");
+                        // ASR 需要一个可公开下载的 URL，所以返回 GET 预签名 URL
+                        String getUrl = CosSigner.presignedGetUrl(bucket, region, secretId, secretKey, key);
+                        evalJs("onUploadOk('" + escapeJs(getUrl) + "')");
                     } else {
                         String msg = readStream(conn.getErrorStream());
                         evalJs("onUploadErr('HTTP " + code + " " + escapeJs(msg) + "')");
@@ -303,11 +305,21 @@ public class MainActivity extends Activity {
         }
     }
 
-    // COS 预签名 URL 生成（签名 v1，仅用于 PUT Object）
+    // COS 预签名 URL 生成（签名 v1，支持 PUT Object / GET Object）
     // 注：COS 的 sign_key 是 hex 字符串，第二次 HMAC 时直接把它当字符串用（不解码成字节）
     private static class CosSigner {
         static String presignedPutUrl(String bucket, String region, String secretId,
                                       String secretKey, String key) throws Exception {
+            return presignedUrl("put", bucket, region, secretId, secretKey, key);
+        }
+
+        static String presignedGetUrl(String bucket, String region, String secretId,
+                                      String secretKey, String key) throws Exception {
+            return presignedUrl("get", bucket, region, secretId, secretKey, key);
+        }
+
+        private static String presignedUrl(String method, String bucket, String region,
+                                           String secretId, String secretKey, String key) throws Exception {
             String host = bucket + ".cos." + region + ".myqcloud.com";
             String encodedKey = encodeKey(key);
             long now = System.currentTimeMillis() / 1000;
@@ -315,7 +327,7 @@ public class MainActivity extends Activity {
             long end = start + 3660;     // 有效 1 小时（与 COS SDK 行为对齐）
             String keyTime = start + ";" + end;
             String signKey = hmacSha1Hex(secretKey.getBytes(StandardCharsets.UTF_8), keyTime);
-            String httpString = "put\n/" + encodedKey + "\n\nhost=" + encodeHeaderValue(host) + "\n";
+            String httpString = method.toLowerCase() + "\n/" + encodedKey + "\n\nhost=" + encodeHeaderValue(host) + "\n";
             String stringToSign = "sha1\n" + keyTime + "\n" + sha1Hex(httpString) + "\n";
             String signature = hmacSha1Hex(signKey.getBytes(StandardCharsets.UTF_8), stringToSign);
             return "https://" + host + "/" + encodedKey

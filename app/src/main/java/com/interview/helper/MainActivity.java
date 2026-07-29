@@ -32,6 +32,8 @@ import java.util.Date;
 import java.util.Locale;
 import java.util.TimeZone;
 
+import org.json.JSONObject;
+
 /**
  * 这个 App 其实是一个"套壳浏览器"：打开就直接加载我们的面试复盘网页，
  * 全屏显示，没有地址栏，用起来跟原生 App 一样。
@@ -112,6 +114,8 @@ public class MainActivity extends Activity {
         webView.addJavascriptInterface(new RecorderBridge(), "AndroidRecorder");
         // 暴露给网页的桥：绕过 WebView 网络限制，用 App 原生 HTTP 上传文件到 COS
         webView.addJavascriptInterface(new UploadBridge(), "AndroidUploader");
+        // 暴露给网页的桥：绕过 WebView CORS，用 App 原生 HTTP 调用腾讯云 ASR
+        webView.addJavascriptInterface(new AsrBridge(), "AndroidAsr");
 
         // 向系统申请录音权限（安卓 6.0 以上需要运行时申请）
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
@@ -354,6 +358,140 @@ public class MainActivity extends Activity {
         }
 
         static String bytesToHex(byte[] bytes) {
+            StringBuilder sb = new StringBuilder();
+            for (byte b : bytes) sb.append(String.format("%02x", b));
+            return sb.toString();
+        }
+    }
+
+    // 网页通过 AndroidAsr 调用的桥：用 App 原生 HttpURLConnection 调用腾讯云 ASR，绕开 WebView CORS
+    private class AsrBridge {
+        @JavascriptInterface
+        public void transcribe(String cfgJson, String cosUrl) {
+            if (cfgJson == null || cosUrl == null) {
+                evalJs("onAsrErr('参数不完整')");
+                return;
+            }
+            new Thread(() -> {
+                try {
+                    JSONObject cfg = new JSONObject(cfgJson);
+                    String secretId = cfg.optString("secretId", "");
+                    String secretKey = cfg.optString("secretKey", "");
+                    if (secretId.isEmpty() || secretKey.isEmpty()) {
+                        evalJs("onAsrErr('缺少腾讯云 SecretId/SecretKey')");
+                        return;
+                    }
+                    String taskId = asrCreateTask(cosUrl, secretId, secretKey);
+                    for (int i = 0; i < 120; i++) {
+                        Thread.sleep(5000);
+                        JSONObject st = asrDescribeTask(taskId, secretId, secretKey);
+                        int status = st.optInt("Status", -1);
+                        if (status == 2) {
+                            String result = st.optString("Result", "");
+                            evalJs("onAsrResult('" + escapeJs(result) + "')");
+                            return;
+                        } else if (status == 3) {
+                            String err = st.optString("ErrorMsg", "未知错误");
+                            evalJs("onAsrErr('转写失败：" + escapeJs(err) + "')");
+                            return;
+                        }
+                    }
+                    evalJs("onAsrErr('转写超时，请稍后在记录页重试')");
+                } catch (Exception e) {
+                    evalJs("onAsrErr('" + escapeJs(e.getMessage() != null ? e.getMessage() : "识别异常") + "')");
+                }
+            }).start();
+        }
+
+        private String asrCreateTask(String cosUrl, String secretId, String secretKey) throws Exception {
+            JSONObject payload = new JSONObject();
+            payload.put("EngineModelType", "16k_zh");
+            payload.put("ChannelNum", 1);
+            payload.put("ResTextFormat", 0);
+            payload.put("SourceType", 0);
+            payload.put("Url", cosUrl);
+            String resp = tc3Call("asr", "asr.tencentcloudapi.com", "CreateRecTask",
+                    "2019-06-14", "ap-guangzhou", payload.toString(), secretId, secretKey);
+            JSONObject root = new JSONObject(resp);
+            if (root.has("Response") && root.getJSONObject("Response").has("Error")) {
+                JSONObject err = root.getJSONObject("Response").getJSONObject("Error");
+                throw new Exception("创建识别任务失败：" + err.optString("Message", "未知错误"));
+            }
+            return root.getJSONObject("Response").getJSONObject("Data").getString("TaskId");
+        }
+
+        private JSONObject asrDescribeTask(String taskId, String secretId, String secretKey) throws Exception {
+            JSONObject payload = new JSONObject();
+            payload.put("TaskId", taskId);
+            String resp = tc3Call("asr", "asr.tencentcloudapi.com", "DescribeTaskStatus",
+                    "2019-06-14", "ap-guangzhou", payload.toString(), secretId, secretKey);
+            JSONObject root = new JSONObject(resp);
+            if (root.has("Response") && root.getJSONObject("Response").has("Error")) {
+                JSONObject err = root.getJSONObject("Response").getJSONObject("Error");
+                throw new Exception("查询识别失败：" + err.optString("Message", "未知错误"));
+            }
+            return root.getJSONObject("Response").getJSONObject("Data");
+        }
+
+        private String tc3Call(String service, String host, String action, String version,
+                               String region, String payload, String secretId, String secretKey) throws Exception {
+            long t = System.currentTimeMillis() / 1000;
+            String date = new SimpleDateFormat("yyyy-MM-dd", Locale.US).format(new Date(t * 1000));
+            String ct = "application/json; charset=utf-8";
+            String canonicalHeaders = "content-type:" + ct + "\nhost:" + host + "\n";
+            String signedHeaders = "content-type;host";
+            String payloadHash = sha256Hex(payload);
+            String canonicalRequest = "POST\n/\n\n" + canonicalHeaders + signedHeaders + "\n" + payloadHash;
+            String credentialScope = date + "/" + service + "/tc3_request";
+            String stringToSign = "TC3-HMAC-SHA256\n" + t + "\n" + credentialScope + "\n" + sha256Hex(canonicalRequest);
+            byte[] secretDate = hmacSha256(("TC3" + secretKey).getBytes(StandardCharsets.UTF_8), date);
+            byte[] secretService = hmacSha256(secretDate, service);
+            byte[] secretSigning = hmacSha256(secretService, "tc3_request");
+            String signature = bytesToHex(hmacSha256(secretSigning, stringToSign));
+            String authorization = "TC3-HMAC-SHA256 Credential=" + secretId + "/" + credentialScope
+                    + ", SignedHeaders=" + signedHeaders + ", Signature=" + signature;
+            HttpURLConnection conn = (HttpURLConnection) new URL("https://" + host).openConnection();
+            conn.setRequestMethod("POST");
+            conn.setDoOutput(true);
+            conn.setConnectTimeout(20000);
+            conn.setReadTimeout(60000);
+            conn.setRequestProperty("Content-Type", ct);
+            conn.setRequestProperty("Host", host);
+            conn.setRequestProperty("Authorization", authorization);
+            conn.setRequestProperty("X-TC-Action", action);
+            conn.setRequestProperty("X-TC-Timestamp", String.valueOf(t));
+            conn.setRequestProperty("X-TC-Version", version);
+            if (region != null && !region.isEmpty()) {
+                conn.setRequestProperty("X-TC-Region", region);
+            }
+            byte[] body = payload.getBytes(StandardCharsets.UTF_8);
+            conn.setFixedLengthStreamingMode(body.length);
+            OutputStream out = conn.getOutputStream();
+            out.write(body);
+            out.flush();
+            out.close();
+            int code = conn.getResponseCode();
+            java.io.InputStream is = (code >= 200 && code < 300) ? conn.getInputStream() : conn.getErrorStream();
+            String resp = readStream(is);
+            conn.disconnect();
+            if (code < 200 || code >= 300) {
+                throw new Exception("HTTP " + code + " " + resp);
+            }
+            return resp;
+        }
+
+        private byte[] hmacSha256(byte[] key, String msg) throws Exception {
+            javax.crypto.Mac mac = javax.crypto.Mac.getInstance("HmacSHA256");
+            mac.init(new javax.crypto.spec.SecretKeySpec(key, "HmacSHA256"));
+            return mac.doFinal(msg.getBytes(StandardCharsets.UTF_8));
+        }
+
+        private String sha256Hex(String data) throws Exception {
+            MessageDigest md = MessageDigest.getInstance("SHA-256");
+            return bytesToHex(md.digest(data.getBytes(StandardCharsets.UTF_8)));
+        }
+
+        private String bytesToHex(byte[] bytes) {
             StringBuilder sb = new StringBuilder();
             for (byte b : bytes) sb.append(String.format("%02x", b));
             return sb.toString();

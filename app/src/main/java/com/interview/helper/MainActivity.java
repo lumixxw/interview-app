@@ -436,12 +436,15 @@ public class MainActivity extends Activity {
         private String tc3Call(String service, String host, String action, String version,
                                String region, String payload, String secretId, String secretKey) throws Exception {
             long t = System.currentTimeMillis() / 1000;
-            String date = new SimpleDateFormat("yyyy-MM-dd", Locale.US).format(new Date(t * 1000));
-            String ct = "application/json; charset=utf-8";
+            SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd", Locale.US);
+            sdf.setTimeZone(TimeZone.getTimeZone("UTC"));
+            String date = sdf.format(new Date(t * 1000));
+            String ct = "application/json";
             String canonicalHeaders = "content-type:" + ct + "\nhost:" + host + "\n";
             String signedHeaders = "content-type;host";
             String payloadHash = sha256Hex(payload);
-            String canonicalRequest = "POST\n/\n\n" + canonicalHeaders + signedHeaders + "\n" + payloadHash;
+            // CanonicalHeaders 本身以 \n 结尾，后面还要再跟一个 \n 作为段分隔符
+            String canonicalRequest = "POST\n/\n\n" + canonicalHeaders + "\n" + signedHeaders + "\n" + payloadHash;
             String credentialScope = date + "/" + service + "/tc3_request";
             String stringToSign = "TC3-HMAC-SHA256\n" + t + "\n" + credentialScope + "\n" + sha256Hex(canonicalRequest);
             byte[] secretDate = hmacSha256(("TC3" + secretKey).getBytes(StandardCharsets.UTF_8), date);

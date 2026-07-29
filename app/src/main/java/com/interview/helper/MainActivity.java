@@ -381,7 +381,7 @@ public class MainActivity extends Activity {
                         evalJs("onAsrErr('缺少腾讯云 SecretId/SecretKey')");
                         return;
                     }
-                    String taskId = asrCreateTask(cosUrl, secretId, secretKey);
+                    long taskId = asrCreateTask(cosUrl, secretId, secretKey);
                     for (int i = 0; i < 120; i++) {
                         Thread.sleep(5000);
                         JSONObject st = asrDescribeTask(taskId, secretId, secretKey);
@@ -403,7 +403,7 @@ public class MainActivity extends Activity {
             }).start();
         }
 
-        private String asrCreateTask(String cosUrl, String secretId, String secretKey) throws Exception {
+        private long asrCreateTask(String cosUrl, String secretId, String secretKey) throws Exception {
             JSONObject payload = new JSONObject();
             payload.put("EngineModelType", "16k_zh");
             payload.put("ChannelNum", 1);
@@ -417,10 +417,14 @@ public class MainActivity extends Activity {
                 JSONObject err = root.getJSONObject("Response").getJSONObject("Error");
                 throw new Exception("创建识别任务失败：" + err.optString("Message", "未知错误"));
             }
-            return root.getJSONObject("Response").getJSONObject("Data").getString("TaskId");
+            JSONObject data = root.getJSONObject("Response").optJSONObject("Data");
+            if (data == null || !data.has("TaskId")) {
+                throw new Exception("创建识别任务失败：响应中缺少 TaskId");
+            }
+            return data.getLong("TaskId");
         }
 
-        private JSONObject asrDescribeTask(String taskId, String secretId, String secretKey) throws Exception {
+        private JSONObject asrDescribeTask(long taskId, String secretId, String secretKey) throws Exception {
             JSONObject payload = new JSONObject();
             payload.put("TaskId", taskId);
             String resp = tc3Call("asr", "asr.tencentcloudapi.com", "DescribeTaskStatus",

@@ -43,7 +43,7 @@ import org.json.JSONObject;
 public class MainActivity extends Activity {
 
     // 打开 App 就加载我们的网页（钥匙请在 App 内「设置」页填一次，之后自动记住；不写死密钥，避免泄露）
-    private static final String TARGET_URL = "https://7869008e292e4b66b09994191b175125.app.codebuddy.work/index.html";
+    private static final String TARGET_URL = "https://d6ed16d777914e9389ba1410a33c6265.gz1.agentos-app.net/index.html";
 
     private static final int REQUEST_RECORD = 1;
     private static final int REQUEST_SELECT_FILE = 100;
@@ -82,7 +82,7 @@ public class MainActivity extends Activity {
                 final String origin = request.getOrigin().toString();
                 runOnUiThread(() -> {
                     // 只放行我们自己网站的权限请求，更安全
-                    if (origin.contains("codebuddy.work")) {
+                    if (origin.contains("codebuddy.work") || origin.contains("agentos-app.net")) {
                         request.grant(request.getResources());
                     } else {
                         request.deny();

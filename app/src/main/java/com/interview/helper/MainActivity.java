@@ -119,6 +119,7 @@ public class MainActivity extends Activity {
         webView.addJavascriptInterface(new AsrBridge(), "AndroidAsr");
         // 暴露给网页的桥：把录音文件分享到微信等应用
         webView.addJavascriptInterface(new ShareBridge(), "AndroidShare");
+        webView.addJavascriptInterface(new SyncBridge(), "AndroidSync");
 
         // 向系统申请录音权限（安卓 6.0 以上需要运行时申请）
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
@@ -321,6 +322,32 @@ public class MainActivity extends Activity {
             return presignedUrl("get", bucket, region, secretId, secretKey, key);
         }
 
+        static String presignedDeleteUrl(String bucket, String region, String secretId,
+                                         String secretKey, String key) throws Exception {
+            return presignedUrl("delete", bucket, region, secretId, secretKey, key);
+        }
+
+        static String presignedListUrl(String bucket, String region, String secretId,
+                                       String secretKey, String prefix) throws Exception {
+            String host = bucket + ".cos." + region + ".myqcloud.com";
+            String encPrefix = "prefix=" + URLEncoder.encode(prefix, "UTF-8");
+            long now = System.currentTimeMillis() / 1000;
+            long start = now - 60, end = start + 3660;
+            String keyTime = start + ";" + end;
+            String signKey = hmacSha1Hex(secretKey.getBytes(StandardCharsets.UTF_8), keyTime);
+            String httpString = "get\n/\n" + encPrefix + "\nhost=" + encodeHeaderValue(host) + "\n";
+            String stringToSign = "sha1\n" + keyTime + "\n" + sha1Hex(httpString) + "\n";
+            String signature = hmacSha1Hex(signKey.getBytes(StandardCharsets.UTF_8), stringToSign);
+            return "https://" + host + "/?" + encPrefix
+                    + "&q-sign-algorithm=sha1"
+                    + "&q-ak=" + URLEncoder.encode(secretId, "UTF-8")
+                    + "&q-sign-time=" + keyTime
+                    + "&q-key-time=" + keyTime
+                    + "&q-header-list=host"
+                    + "&q-url-param-list=prefix"
+                    + "&q-signature=" + signature;
+        }
+
         private static String presignedUrl(String method, String bucket, String region,
                                            String secretId, String secretKey, String key) throws Exception {
             String host = bucket + ".cos." + region + ".myqcloud.com";
@@ -376,6 +403,132 @@ public class MainActivity extends Activity {
             StringBuilder sb = new StringBuilder();
             for (byte b : bytes) sb.append(String.format("%02x", b));
             return sb.toString();
+        }
+    }
+
+    // 网页通过 AndroidSync 调用的桥：绕过 WebView 网络限制，用 App 原生 HTTP 同步 COS 上的面试记录
+    private class SyncBridge {
+        private String bBucket, bRegion, bSid, bSkey;
+        @JavascriptInterface
+        public void init(String bucket, String region, String secretId, String secretKey) {
+            bBucket = bucket; bRegion = region; bSid = secretId; bSkey = secretKey;
+        }
+        @JavascriptInterface
+        public void upload(String id, String json, String audioB64, String hasAudio) {
+            if (id == null || json == null) { evalJs("onSyncUploaded('" + escapeJs(id) + "')"); return; }
+            new Thread(() -> {
+                try {
+                    byte[] jdata = json.getBytes(StandardCharsets.UTF_8);
+                    putObject(bBucket, bRegion, bSid, bSkey, "sync/" + id + ".json", jdata, "application/json");
+                    if ("1".equals(hasAudio) && audioB64 != null && !audioB64.isEmpty()) {
+                        byte[] adata = Base64.decode(audioB64, Base64.DEFAULT);
+                        putObject(bBucket, bRegion, bSid, bSkey, "sync/" + id + ".bin", adata, "application/octet-stream");
+                    }
+                    evalJs("onSyncUploaded('" + escapeJs(id) + "')");
+                } catch (Exception e) {
+                    evalJs("onSyncUploaded('" + escapeJs(id) + "')");
+                }
+            }).start();
+        }
+        @JavascriptInterface
+        public void list() {
+            new Thread(() -> {
+                try {
+                    String url = CosSigner.presignedListUrl(bBucket, bRegion, bSid, bSkey, "sync/");
+                    String xml = httpGet(url);
+                    StringBuilder ids = new StringBuilder("[");
+                    int idx = 0, cnt = 0;
+                    while ((idx = xml.indexOf("<Key>", idx)) >= 0) {
+                        int s = idx + 5, e = xml.indexOf("</Key>", s);
+                        if (e < 0) break;
+                        String k = xml.substring(s, e);
+                        if (k.endsWith(".json")) {
+                            String i = k.substring("sync/".length(), k.length() - ".json".length());
+                            if (cnt++ > 0) ids.append(",");
+                            ids.append("\"").append(i).append("\"");
+                        }
+                        idx = e + 6;
+                    }
+                    ids.append("]");
+                    evalJs("onSyncList('" + escapeJs(ids.toString()) + "')");
+                } catch (Exception e) {
+                    evalJs("onSyncList('[]')");
+                }
+            }).start();
+        }
+        @JavascriptInterface
+        public void download(String id) {
+            if (id == null) { evalJs("onSyncDownloaded('" + escapeJs(id) + "','','0')"); return; }
+            new Thread(() -> {
+                try {
+                    String json = httpGet(CosSigner.presignedGetUrl(bBucket, bRegion, bSid, bSkey, "sync/" + id + ".json"));
+                    boolean has = json.contains("\"hasAudio\":true");
+                    String audioB64 = "";
+                    if (has) {
+                        byte[] adata = httpGetBytes(CosSigner.presignedGetUrl(bBucket, bRegion, bSid, bSkey, "sync/" + id + ".bin"));
+                        audioB64 = Base64.encodeToString(adata, Base64.NO_WRAP);
+                    }
+                    evalJs("onSyncDownloaded('" + escapeJs(id) + "','" + escapeJs(json) + "','" + escapeJs(audioB64) + "','" + (has ? "1" : "0") + "')");
+                } catch (Exception e) {
+                    evalJs("onSyncDownloaded('" + escapeJs(id) + "','','0')");
+                }
+            }).start();
+        }
+        @JavascriptInterface
+        public void remove(String id) {
+            if (id == null) { evalJs("onSyncRemoved('" + escapeJs(id) + "')"); return; }
+            new Thread(() -> {
+                try {
+                    httpDelete(CosSigner.presignedDeleteUrl(bBucket, bRegion, bSid, bSkey, "sync/" + id + ".json"));
+                    httpDelete(CosSigner.presignedDeleteUrl(bBucket, bRegion, bSid, bSkey, "sync/" + id + ".bin"));
+                } catch (Exception ignored) {}
+                evalJs("onSyncRemoved('" + escapeJs(id) + "')");
+            }).start();
+        }
+        private void putObject(String bucket, String region, String sid, String skey, String key, byte[] data, String mime) throws Exception {
+            String url = CosSigner.presignedPutUrl(bucket, region, sid, skey, key);
+            HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
+            conn.setRequestMethod("PUT");
+            conn.setDoOutput(true);
+            conn.setConnectTimeout(20000);
+            conn.setReadTimeout(60000);
+            conn.setRequestProperty("Content-Type", mime);
+            conn.setFixedLengthStreamingMode(data.length);
+            java.io.OutputStream out = conn.getOutputStream();
+            out.write(data); out.flush(); out.close();
+            conn.getResponseCode();
+            conn.disconnect();
+        }
+        private String httpGet(String url) throws Exception {
+            HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
+            conn.setRequestMethod("GET");
+            conn.setConnectTimeout(20000);
+            conn.setReadTimeout(60000);
+            java.io.BufferedReader br = new java.io.BufferedReader(new java.io.InputStreamReader(conn.getInputStream(), StandardCharsets.UTF_8));
+            StringBuilder sb = new StringBuilder(); String line;
+            while ((line = br.readLine()) != null) sb.append(line);
+            br.close(); conn.disconnect();
+            return sb.toString();
+        }
+        private byte[] httpGetBytes(String url) throws Exception {
+            HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
+            conn.setRequestMethod("GET");
+            conn.setConnectTimeout(20000);
+            conn.setReadTimeout(60000);
+            java.io.InputStream in = conn.getInputStream();
+            java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
+            byte[] buf = new byte[8192]; int n;
+            while ((n = in.read(buf)) > 0) bos.write(buf, 0, n);
+            in.close(); conn.disconnect();
+            return bos.toByteArray();
+        }
+        private void httpDelete(String url) throws Exception {
+            HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
+            conn.setRequestMethod("DELETE");
+            conn.setConnectTimeout(20000);
+            conn.setReadTimeout(60000);
+            conn.getResponseCode();
+            conn.disconnect();
         }
     }
 
